@@ -21,8 +21,7 @@
 
 #include "PTPDef.h"
 
-#include "PN532_I2C.h"
-#include "PN532.h"
+#include "m5unit_nfc_idf.hpp"
 
 #if 1	// capsule
 	#define P_SDA		GPIO_NUM_13
@@ -31,7 +30,8 @@
 	#define P_SDA		GPIO_NUM_6
 	#define P_SCL		GPIO_NUM_5
 #endif
-#define I2C_PORT	I2C_NUM_1
+#define I2C_PORT		I2C_NUM_1
+#define I2C_CLOCK_HZ	100000	// 400000 ng
 //#define P_BUTTON	GPIO_NUM_42
 //#define P_BUZZER	GPIO_NUM_2
 
@@ -64,9 +64,6 @@
 #endif
 
 static const char *TAG = "DAEMON";
-
-PN532_I2C pn532i2c(I2C_PORT, P_SDA, P_SCL);
-PN532 nfc(pn532i2c);
 
 
 #define DAEMON_TASK_PRIORITY    2
@@ -543,33 +540,34 @@ static int updateDeviceProp(int onlyDiff)
 	return 0;
 }
 
-int polling_nfc(void)
+int polling_nfc(m5unit::nfc::St25r3916* nfc)
 {
     int ret;
 	uint8_t buf[64];
-	#define RequestCode  0x01       // System Code request
 
-	uint8_t idm[8];
-	uint8_t pmm[8];
-	uint16_t systemCodeResponse;
-	ret = nfc.felica_Polling(NFCID_Services, RequestCode, idm, pmm, &systemCodeResponse, 50);
-	if(ret <= 0) {
-		return -1;
-	}
+    m5unit::nfc::FelicaPollingResult card{};
+    ret = nfc->polling(card, NFCID_Services, m5unit::nfc::FelicaRequestCode::None);
+    if (ret != ESP_OK) {
+        return -1;
+    }
 //	printf("  IDm: %02x%02x%02x%02x%02x%02x%02x%02x\n", idm[0],idm[1],idm[2],idm[3],idm[4],idm[5],idm[6],idm[7]);
 //	printf("  PMm: %02x%02x%02x%02x%02x%02x%02x%02x\n", pmm[0],pmm[1],pmm[2],pmm[3],pmm[4],pmm[5],pmm[6],pmm[7]);
 
 	#define BLOCK_ID	0
-	uint16_t services = NFCID_Service;
-	uint16_t blockList[1];
-	uint8_t blockData[1][16];
+	uint8_t blockData[16]{};
 
-	blockList[0] = 0x8000 | BLOCK_ID;		// 0x80 00 | blockIndex
-	ret = nfc.felica_ReadWithoutEncryption(1, &services, 1, blockList, blockData);
-	if(ret <= 0) {
-		return -1;
+	uint16_t key_version = 0xFFFF;
+	ret = nfc->request_service(card, NFCID_Service, key_version);
+	if (ret != ESP_OK || key_version == 0xFFFF) {
+		ESP_LOGW(TAG, "Service %04X not found: %d keyVersion:%04X", NFCID_Service, ret, key_version);
+        return -1;
 	}
-	for(int i = 0; i < 16; i++) printf("%02x ", blockData[0][i]);
+
+	ret = nfc->read_without_encryption(card, NFCID_Service, BLOCK_ID, blockData, sizeof(blockData));
+	if (ret != ESP_OK) {
+        return -1;
+	}
+	for(int i = 0; i < 16; i++) printf("%02x ", blockData[i]);
 	printf("\n");
 
 	int len = NFCID_Length;
@@ -579,7 +577,7 @@ int polling_nfc(void)
 		// xxxx-xxxx-xxxx-xxxx
 		const char hex[] = "0123456789abcdef";
 		for(int i = 0; i < len/2; i++) {
-			int data = blockData[0][NFCID_Offset+i];
+			int data = blockData[NFCID_Offset+i];
 			buf[1+i*4+0] = 0;
 			buf[1+i*4+1] = hex[(data>>4)&0xf];
 			buf[1+i*4+2] = 0;
@@ -587,7 +585,7 @@ int polling_nfc(void)
 		}
 	  #elif defined(NFCID_Type_ASCII)
 		for(int i = 0; i < len; i++) {
-			int data = blockData[0][NFCID_Offset+i];
+			int data = blockData[NFCID_Offset+i];
 			buf[1+i*2+0] = 0;
 			buf[1+i*2+1] = data;
 		}
@@ -601,19 +599,14 @@ int polling_nfc(void)
 
 extern "C" void app_main(void)
 {
-	nfc.begin();
+	int ret;
 
-	vTaskDelay(50);
-
-	uint32_t versiondata = nfc.getFirmwareVersion();
-	if(!versiondata) {
-		printf("no PN532\n");
+	m5unit::nfc::St25r3916 nfc(I2C_PORT, P_SDA, P_SCL, I2C_CLOCK_HZ);
+    ret = nfc.begin();
+    if (ret != ESP_OK) {
+		printf("no nfc\n");
 		return;
 	}
-	uint8_t* dp = (uint8_t*)&versiondata;
-	printf("\n" "chip:PN5%02x, ver%d.%d\n", dp[3], dp[2], dp[1]);
-	nfc.setPassiveActivationRetries(0xFF);
-	nfc.SAMConfig();
 
 	usb_host_init();
 
@@ -671,7 +664,7 @@ extern "C" void app_main(void)
 	ESP_LOGI(TAG, "start loop\n");
 
 	while(1) {
-		polling_nfc();
+		polling_nfc(&nfc);
 
 		if(g_driver_obj.ptpEvent & EVENT_DP_Changed) {
 			g_driver_obj.ptpEvent &= ~EVENT_DP_Changed;
